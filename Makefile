@@ -27,12 +27,7 @@ download = $(if $(NO_DOWNLOAD),@test -e $@ && echo "  NO_DOWNLOAD: reusing $@" |
 
 PROCESSED := \
 	data/processed/eagle-i.parquet \
-	data/processed/wfbz.parquet \
-	data/processed/wfsmoke.parquet
 
-# merge.R joins the individual processed datasets into one merged table, so its
-# output depends on all of the above.
-MERGED := merged.parquet
 
 # Each figures/*.R script writes several PNGs at once into its own
 # figures/<name>/ directory, so — like eagle-i's and county's downloads — we
@@ -47,8 +42,6 @@ FIGURES := \
 all: $(MERGED) $(FIGURES)                ## Build every processed dataset and figure (default)
 
 data: data/raw/eagle-i/.stamp \
-      data/raw/wfbz/wfbz.geojson \
-      data/raw/wfsmoke/wfsmoke.rds \
       data/raw/county/.stamp             ## Download all raw data
 
 figures: $(FIGURES)                      ## Generate all figures
@@ -63,12 +56,6 @@ data/raw/eagle-i/.stamp: $(DATA)/eagle-i.sh $(DATA)/figshare_sync.sh
 	$(call download,$(DATA)/eagle-i.sh)
 	@touch $@
 
-data/raw/wfbz/wfbz.geojson: $(DATA)/wfbz.sh
-	$(call download,$(DATA)/wfbz.sh)
-
-data/raw/wfsmoke/wfsmoke.rds: $(DATA)/wfsmoke.sh
-	$(call download,$(DATA)/wfsmoke.sh)
-
 # counties.R downloads one county shapefile per year (2018-2025), so we track a
 # stamp rather than a single output file.
 data/raw/county/.stamp: $(DATA)/counties.R
@@ -82,16 +69,6 @@ data/raw/county/.stamp: $(DATA)/counties.R
 data/processed/eagle-i.parquet: $(PREP)/eagle-i.R data/raw/eagle-i/.stamp data/raw/county/.stamp
 	$(R) $<
 
-data/processed/wfbz.parquet: $(PREP)/wfbz.R data/raw/wfbz/wfbz.geojson data/raw/county/.stamp
-	$(R) $<
-
-data/processed/wfsmoke.parquet: $(PREP)/wfsmoke.R data/raw/wfsmoke/wfsmoke.rds
-	$(R) $<
-
-# merge depends on every individual processed dataset; re-run it whenever any of
-# them (or merge.R itself) changes.
-$(MERGED): $(PREP)/merge.R $(PROCESSED)
-	$(R) $<
 
 # ---------------------------------------------------------------------------
 # 2. Generate figures
@@ -121,7 +98,7 @@ clean-processed:                         ## Remove processed parquet files
 	rm -f $(PROCESSED) $(MERGED)
 
 clean-raw:                               ## Remove downloaded raw data
-	rm -rf data/raw/eagle-i data/raw/wfbz data/raw/wfsmoke data/raw/county
+	rm -rf data/raw/eagle-i 
 
 clean-figures:                           ## Remove generated figures
 	rm -rf figures/by_state figures/time_series
