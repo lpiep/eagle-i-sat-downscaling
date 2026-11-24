@@ -1,6 +1,6 @@
 options(scipen = 999)
 if (!require("pacman", quietly = TRUE)) {
-  install.packages("pacman")
+  install.packages("pacman", repos = "https://cloud.r-project.org")
 }
 pacman::p_load(glue, fs, here)
 
@@ -65,7 +65,7 @@ download_spatial_ghs_pop <- function(yr, dst) {
   outfile
 }
 
-popfile['2020'] <- download_spatial_ghs_pop(
+download_spatial_ghs_pop(
   2020,
   here('data/raw/')
 )

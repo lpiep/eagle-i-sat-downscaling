@@ -1,6 +1,6 @@
 options(scipen = 999)
 if (!require("pacman", quietly = TRUE)) {
-  install.packages("pacman")
+  install.packages("pacman", repos = "https://cloud.r-project.org")
 }
 pacman::p_load(tidyverse, here, fs, arrow, PNWColors)
 pacman::p_load_gh('lpiep/gguw')

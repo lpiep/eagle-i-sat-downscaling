@@ -1,0 +1,341 @@
+---
+title: "QC: Outages with VIIRS Image"
+subtitle: "Quality checks for `outages-with-viirs-image.parquet`"
+format: gfm
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+## Scope
+
+This report checks the final Parquet file's schema, completeness, county codes,
+duplicate keys, outage-to-granule time overlap, local-time selection, and
+selected numeric values. Checks are descriptive; review flags do not modify the
+dataset.
+
+The report reads the existing Parquet file; it does not rebuild it. Run
+`make` before rendering after changing preprocessing logic.
+
+The local-time check uses the generated county time-zone lookup tables when
+available. The current Parquet schema does not retain `tzid`, so the report
+reconstructs it from those lookup files.
+
+```{r}
+library(arrow)
+library(dplyr)
+library(ggplot2)
+library(knitr)
+library(lubridate)
+library(readr)
+
+data_candidates <- c(
+  "outages-with-viirs-image.parquet",
+  "../outages-with-viirs-image.parquet"
+)
+dataset_path <- data_candidates[file.exists(data_candidates)][1]
+if (is.na(dataset_path)) {
+  stop("Could not find outages-with-viirs-image.parquet in the repository root.")
+}
+
+raw_data <- arrow::read_parquet(dataset_path) |>
+  dplyr::ungroup()
+fields <- names(raw_data)
+data <- raw_data |>
+  mutate(year = lubridate::year(eaglei_outage_time_utc))
+
+lookup_dir <- if (dir.exists("data/processed")) {
+  "data/processed"
+} else {
+  "../data/processed"
+}
+file_size_mb <- round(file.info(dataset_path)$size / 1024^2, 1)
+```
+
+## Dataset overview
+
+```{r}
+overview <- tibble(
+  Measure = c(
+    "File",
+    "File size",
+    "Rows",
+    "Columns",
+    "County FIPS codes",
+    "FIPS state/territory prefixes",
+    "VIIRS granule IDs",
+    "Earliest Eagle-I time (UTC)",
+    "Latest Eagle-I time (UTC)"
+  ),
+  Value = c(
+    basename(dataset_path),
+    paste(file_size_mb, "MiB"),
+    format(nrow(data), big.mark = ","),
+    length(fields),
+    format(n_distinct(data$fips_code), big.mark = ","),
+    format(n_distinct(substr(data$fips_code, 1, 2)), big.mark = ","),
+    format(n_distinct(data$viirs_id), big.mark = ","),
+    format(min(data$eaglei_outage_time_utc), "%Y-%m-%d %H:%M:%S UTC", tz = "UTC"),
+    format(max(data$eaglei_outage_time_utc), "%Y-%m-%d %H:%M:%S UTC", tz = "UTC")
+  )
+)
+
+knitr::kable(overview, col.names = c("Measure", "Value"))
+```
+
+### Rows by year
+
+```{r}
+year_counts <- data |>
+  count(year, name = "rows") |>
+  arrange(year)
+
+ggplot(year_counts, aes(x = factor(year), y = rows)) +
+  geom_col(fill = "#2878A0") +
+  scale_y_continuous(labels = scales::label_comma()) +
+  labs(x = "Eagle-I year (UTC)", y = "Rows", title = "Final records by year") +
+  theme_minimal()
+```
+
+## Completeness and schema
+
+```{r}
+field_types <- vapply(
+  raw_data,
+  function(x) {
+    if (inherits(x, "POSIXct")) {
+      "timestamp"
+    } else if (is.character(x)) {
+      "string"
+    } else if (is.numeric(x)) {
+      "numeric"
+    } else {
+      paste(class(x), collapse = "/")
+    }
+  },
+  character(1)
+)
+
+missingness <- tibble(
+  field = fields,
+  type = unname(field_types),
+  missing = vapply(raw_data, function(x) sum(is.na(x)), integer(1))
+) |>
+  mutate(percent_missing = 100 * missing / nrow(raw_data))
+
+knitr::kable(
+  missingness,
+  digits = 2,
+  col.names = c("Field", "Type", "Missing rows", "Missing (%)")
+)
+```
+
+```{r}
+ggplot(missingness, aes(x = reorder(field, percent_missing), y = percent_missing)) +
+  geom_col(fill = "#C47A28") +
+  coord_flip() +
+  scale_y_continuous(labels = function(x) paste0(x, "%")) +
+  labs(x = NULL, y = "Missing rows (%)", title = "Field completeness") +
+  theme_minimal()
+```
+
+`total_customers` contains only values provided by the raw Eagle-I files; it
+is not filled from coverage estimates. `est_total_customers` is a separate
+estimate allocated from state coverage totals using ACS county household
+shares, with 2022 totals carried forward to estimate 2023–2024. Connecticut
+uses 2021 ACS county estimates from the last vintage with its former county
+geography. U.S. Virgin Islands records (FIPS prefix `78`) are excluded.
+Missing `total_customers` values are expected when the raw file does not
+provide them.
+
+## Integrity checks
+
+```{r}
+expected_fields <- c(
+  "fips_code",
+  "eaglei_outage_time_utc",
+  "viirs_id",
+  "viirs_pass_start_time_utc",
+  "viirs_pass_end_time_utc",
+  "total_customers",
+  "est_total_customers",
+  "customers_out",
+  "customers_out_8hr_prior"
+)
+missing_fields <- setdiff(expected_fields, fields)
+key_fields <- c(
+  "fips_code",
+  "eaglei_outage_time_utc",
+  "viirs_id",
+  "viirs_pass_start_time_utc",
+  "viirs_pass_end_time_utc"
+)
+
+bad_fips <- sum(
+  is.na(data$fips_code) | !grepl("^[0-9]{5}$", data$fips_code)
+)
+vi_fips_rows <- sum(grepl("^78", data$fips_code), na.rm = TRUE)
+ct_legacy_fips <- c(
+  "09001", "09003", "09005", "09007",
+  "09009", "09011", "09013", "09015"
+)
+ct_missing_estimates <- sum(
+  data$year >= 2022 &
+    data$fips_code %in% ct_legacy_fips &
+    is.na(data$est_total_customers)
+)
+duplicate_key_rows <- nrow(data) -
+  nrow(distinct(data, across(all_of(key_fields))))
+bad_pass_durations <- sum(
+  data$viirs_pass_end_time_utc <= data$viirs_pass_start_time_utc,
+  na.rm = TRUE
+)
+bad_overlaps <- sum(
+  data$eaglei_outage_time_utc > data$viirs_pass_end_time_utc |
+    data$eaglei_outage_time_utc + minutes(15) < data$viirs_pass_start_time_utc,
+  na.rm = TRUE
+)
+
+numeric_fields <- c(
+  "total_customers",
+  "est_total_customers",
+  "customers_out",
+  "customers_out_8hr_prior"
+)
+negative_values <- sum(vapply(
+  numeric_fields,
+  function(field) sum(data[[field]] < 0, na.rm = TRUE),
+  integer(1)
+))
+customers_over_estimate <- sum(
+  data$customers_out > data$est_total_customers,
+  na.rm = TRUE
+)
+
+years <- sort(unique(data$year))
+lookup_files <- file.path(lookup_dir, paste0("tz_lookup_", years, ".csv"))
+timezone_missing <- NA_integer_
+local_hour_violations <- NA_integer_
+timezone_check_status <- "SKIP"
+timezone_check_result <- "Annual time-zone lookup CSVs are unavailable."
+
+if ("tzid" %in% fields) {
+  local_data <- data
+  timezone_missing <- sum(is.na(local_data$tzid))
+  local_data <- local_data |>
+    filter(!is.na(tzid)) |>
+    group_by(tzid) |>
+    mutate(local_hour = hour(with_tz(eaglei_outage_time_utc, first(tzid)))) |>
+    ungroup()
+  local_hour_violations <- sum(!local_data$local_hour %in% 0:2, na.rm = TRUE)
+  timezone_check_status <- if (timezone_missing == 0L &&
+    local_hour_violations == 0L) "PASS" else "REVIEW"
+  timezone_check_result <- paste(
+    timezone_missing, "missing time zones;",
+    local_hour_violations, "rows outside local hours 00:00–02:45"
+  )
+} else if (all(file.exists(lookup_files))) {
+  timezone_lookup <- bind_rows(lapply(seq_along(lookup_files), function(i) {
+    readr::read_csv(
+      lookup_files[[i]],
+      col_types = cols(
+        fips_code = col_character(),
+        tzid = col_character()
+      ),
+      show_col_types = FALSE
+    ) |>
+      mutate(year = years[[i]])
+  }))
+
+  local_data <- left_join(data, timezone_lookup, by = c("fips_code", "year"))
+  timezone_missing <- sum(is.na(local_data$tzid))
+  local_data <- local_data |>
+    filter(!is.na(tzid)) |>
+    group_by(tzid) |>
+    mutate(local_hour = hour(with_tz(eaglei_outage_time_utc, first(tzid)))) |>
+    ungroup()
+  local_hour_violations <- sum(!local_data$local_hour %in% 0:2, na.rm = TRUE)
+  timezone_check_status <- if (timezone_missing == 0L &&
+    local_hour_violations == 0L) "PASS" else "REVIEW"
+  timezone_check_result <- paste(
+    timezone_missing, "missing time-zone matches;",
+    local_hour_violations, "rows outside local hours 00:00–02:45"
+  )
+}
+
+checks <- tibble(
+  Check = c(
+    "Expected fields present",
+    "County FIPS has five digits",
+    "U.S. Virgin Islands excluded",
+    "CT legacy-county estimates present",
+    "Composite row key is unique",
+    "VIIRS pass end follows pass start",
+    "15-minute outage interval overlaps VIIRS pass",
+    "County time zone and local-hour filter",
+    "Nonnegative customer counts",
+    "customers_out does not exceed county estimate"
+  ),
+  Status = c(
+    if (length(missing_fields) == 0) "PASS" else "FAIL",
+    if (bad_fips == 0) "PASS" else "FAIL",
+    if (vi_fips_rows == 0) "PASS" else "FAIL",
+    if (ct_missing_estimates == 0) "PASS" else "FAIL",
+    if (duplicate_key_rows == 0) "PASS" else "FAIL",
+    if (bad_pass_durations == 0) "PASS" else "FAIL",
+    if (bad_overlaps == 0) "PASS" else "FAIL",
+    timezone_check_status,
+    if (negative_values == 0) "PASS" else "REVIEW",
+    if (customers_over_estimate == 0) "PASS" else "REVIEW"
+  ),
+  Result = c(
+    if (length(missing_fields) == 0) {
+      paste(length(expected_fields), "expected fields present")
+    } else {
+      paste("Missing:", paste(missing_fields, collapse = ", "))
+    },
+    paste(bad_fips, "invalid codes"),
+    paste(vi_fips_rows, "Virgin Islands rows"),
+    paste(ct_missing_estimates, "post-2021 CT legacy-county estimates missing"),
+    paste(duplicate_key_rows, "duplicate rows"),
+    paste(bad_pass_durations, "invalid durations"),
+    paste(bad_overlaps, "non-overlapping intervals"),
+    timezone_check_result,
+    paste(negative_values, "negative values"),
+    paste(
+      format(customers_over_estimate, big.mark = ","),
+      "rows exceed the ACS-based county estimate"
+    )
+  )
+)
+
+knitr::kable(checks)
+```
+
+`customers_out` exceeding `est_total_customers` is flagged for review, not
+treated as an automatic failure: the county customer estimate is allocated
+from state totals using ACS household shares.
+
+## Numeric summaries
+
+```{r}
+numeric_summary <- bind_rows(lapply(numeric_fields, function(field) {
+  values <- data[[field]]
+  values <- values[is.finite(values)]
+  tibble(
+    field = field,
+    n = length(values),
+    minimum = if (length(values)) min(values) else NA_real_,
+    median = if (length(values)) median(values) else NA_real_,
+    p95 = if (length(values)) unname(quantile(values, 0.95)) else NA_real_,
+    maximum = if (length(values)) max(values) else NA_real_
+  )
+}))
+
+knitr::kable(
+  numeric_summary,
+  digits = 2,
+  col.names = c("Field", "Nonmissing values", "Minimum", "Median", "95th percentile", "Maximum")
+)
+```

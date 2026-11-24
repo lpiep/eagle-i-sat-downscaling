@@ -1,54 +1,23 @@
-# Identify whether counties experienced power outages in 2018 - 2024
-# 
-# A county experiences a power outage when either 5000+ customers or 
-#  1% of the estimated total customers in a county report outage 
-#  for 8 hours or more. 
+# Match Eagle-I outage records to overlapping VIIRS passes during local
+# nighttime hours and summarize outages over the preceding eight hours.
 #
-# Only annual, statewide totals of customers were provided, and only
-#  through 2024. We therefore used the ACS to estimate the percentage
-#  of each state's households were in each county (annually), and assigned
-#  the statewide number of electric customers accordingly. FUTURE: When no 
-#  statewide total was reported (after 2024), we carried forward the 
-#  previous year's total. When no census estimates were available in 
-#  2025, we carried forward 2024's census data. 
+# `total_customers` comes only from raw Eagle-I files and remains missing
+# when the raw data has no value. `est_total_customers` is a separate county
+# estimate allocated from state coverage totals using ACS household shares;
+# 2022 state totals are carried forward for 2023–2024 estimates only.
+# Connecticut uses 2021 ACS county estimates for 2022–2024 to retain its old
+# county boundaries. U.S. Virgin Islands records (FIPS prefix 78) are excluded.
 #
 
 options(scipen = 999)
 if (!require("pacman", quietly = TRUE)) {
-  install.packages("pacman")
+  install.packages("pacman", repos = "https://cloud.r-project.org")
 }
-pacman::p_load(tidyverse, dbplyr, here, lubridate, slider, data.table, fs, arrow, tidycensus, sf, dtplyr)
+pacman::p_load(tidyverse, here, lubridate, data.table, fs, arrow, tidycensus)
 
 if(Sys.getenv('CENSUS_API_KEY') == '') stop("Install a Census API Key with tidycensus (https://walker-data.com/tidycensus/reference/census_api_key.html).")
 
 dir_create(here('data/processed'))
-
-county_sf <- list(
-  `2018` = read_sf(here('data/raw/county/county_2018.geojson')),
-  `2019` = read_sf(here('data/raw/county/county_2019.geojson')),
-  `2020` = read_sf(here('data/raw/county/county_2020.geojson')),
-  `2021` = read_sf(here('data/raw/county/county_2021.geojson')),
-  `2022` = read_sf(here('data/raw/county/county_2021.geojson')),#using 2021 for subsequent years since other data sets don't use CT's new counties
-  `2023` = read_sf(here('data/raw/county/county_2021.geojson')), 
-  `2024` = read_sf(here('data/raw/county/county_2021.geojson'))
-) %>%
-  map(~select(.x, county_fips = GEOID)) %>%
-  map(~filter(.x, !(substr(county_fips, 1, 2) %in% c('02', '15', '72', '78')))) %>% # no AK, HI
-  st_drop_geometry() 
-
-county_days <- map2(
-  county_sf, 
-  c(2018:2024), 
-  ~expand_grid(
-    threshold = c('1%', '5%', '10%'),
-    county_fips = .x$county_fips, 
-    day = seq.Date(ymd(paste(.y, '01', '01')), ymd(paste(.y, '12', '31')), by = 'days')
-  )
-) %>%
-  bind_rows() 
-
-fips_codes <- tidycensus::fips_codes %>%
-  transmute(county_fips = paste0(state_code, county_code), state, county)
 
 annual_cov <- fread(here('data/raw/eagle-i/coverage_history.csv')) %>%
   transmute(
@@ -57,98 +26,176 @@ annual_cov <- fread(here('data/raw/eagle-i/coverage_history.csv')) %>%
     total_customers
   ) %>%
   left_join(
-    fips_codes %>%
+     tidycensus::fips_codes %>%
       transmute(
-        state_fips = substr(county_fips, 1, 2),
+        state_fips = state_code,
         state
       ) %>%
       distinct(),
       by = c('state')
-    ) 
+    )
 
-# carry forward 2022 number of customers after 2022
-annual_cov <- annual_cov %>%
+# Extend coverage totals for estimates only; raw Eagle-I totals remain unchanged.
+annual_cov_carried <- annual_cov %>%
   select(state, state_fips) %>%
   distinct() %>%
-  cross_join(tibble(year = 2023:2024)) %>%
+  tidyr::crossing(year = 2023:2024) %>%
   bind_rows(annual_cov) %>%
+  arrange(state_fips, year) %>%
   group_by(state_fips) %>%
-  arrange(year) %>%
-  fill(total_customers) %>%
-  ungroup() 
+  fill(total_customers, .direction = 'down') %>%
+  ungroup()
+
+viirs_passes <- read_csv('data/processed/viirs-passes.csv')
 
 eaglei_annual_files <- dir_ls(here('data/raw/eagle-i'), glob = '*eaglei_outages*csv')
 eaglei_annual_files <- eaglei_annual_files[which(between(as.numeric(str_extract(eaglei_annual_files, '[0-9]{4}')), 2018, 2024))]
+ct_county_households_2021 <- suppressMessages(
+  get_acs(
+    geography = 'county',
+    state = 'CT',
+    variables = 'B11001_001',
+    year = 2021
+  )
+) %>%
+  transmute(
+    fips_code = GEOID,
+    state_fips = substr(GEOID, 1, 2),
+    estimate,
+    moe
+  )
+
 eaglei <- map(
   eaglei_annual_files,
   function(eaglei_annual_file){
     message(eaglei_annual_file)
-    county_households <- suppressMessages(
+    eaglei_year <- as.numeric(str_extract(eaglei_annual_file, '[0-9]{4}'))
+    acs_county_households <- suppressMessages(
       get_acs(
-        geography = 'county', 
-        variables = 'B11001_001', 
-        year = pmin(2024, as.numeric(str_extract(eaglei_annual_file, '[0-9]{4}'))) # use 2024 ACS estimate since 2025 not yet avail
+        geography = 'county',
+        variables = 'B11001_001',
+        year = pmin(2024, eaglei_year) # use 2024 ACS estimate since 2025 not yet available
       )
     ) %>%
       transmute(
-        fips_code = GEOID, 
+        fips_code = GEOID,
         state_fips = substr(fips_code, 1, 2),
-        year = as.numeric(str_extract(eaglei_annual_file, '[0-9]{4}')),
+        estimate_year = eaglei_year,
         estimate,
         moe
+      )
+
+    if (eaglei_year >= 2022) {
+      # Use the last ACS vintage with Connecticut's former county geographies.
+      acs_county_households <- acs_county_households %>%
+        filter(state_fips != '09') %>%
+        bind_rows(
+          ct_county_households_2021 %>%
+            mutate(estimate_year = eaglei_year)
+        )
+    }
+
+    county_households <- acs_county_households %>%
+      rename(year = estimate_year) %>%
+      left_join(
+        annual_cov_carried %>%
+          transmute(
+            state_fips,
+            year,
+            carried_total_customers = total_customers
+          ),
+        by = c('state_fips', 'year')
       ) %>%
-      left_join(annual_cov, by = c('state_fips', 'year')) %>%
       group_by(state_fips) %>%
       mutate(
         pct_state_households = estimate / sum(estimate),
-        est_total_customers = round(total_customers * pct_state_households)
+        est_total_customers = round(carried_total_customers * pct_state_households)
       ) %>%
       ungroup() %>%
       select(fips_code, est_total_customers)
 
     eaglei <- read_csv(eaglei_annual_file, show_col_types = FALSE) %>%
-      mutate(fips_code = str_pad(fips_code, width = 5, pad = '0')) %>% 
-      left_join(county_households,  join_by(fips_code)) 
+      mutate(fips_code = str_pad(fips_code, width = 5, pad = '0')) %>%
+      left_join(county_households,  join_by(fips_code))
 
     if('sum' %in% names(eaglei)) eaglei <- rename(eaglei, customers_out = sum) # fix inconsistent naming
-    
-    # identify hours affected by outage
+
+    if(!('total_customers' %in% names(eaglei))) eaglei$total_customers <- NA_real_
+
+    tz_lookup <- read_csv(paste0('data/processed/tz_lookup_', str_extract(eaglei_annual_file, '[0-9]{4}'), '.csv'), show_col_types = FALSE)
+
+    # Determine the local hour for each outage record.
     eaglei <- eaglei %>%
-      select(-matches('^total_customers$')) %>% # this only appears sometimes
-      mutate(
-        `1%` = (customers_out / est_total_customers) > .01 | customers_out >= 5000, # 1% of the county's customers
-        `5%` = (customers_out / est_total_customers) > .05 | customers_out >= 5000, # 5% of the county's customers
-        `10%` = (customers_out / est_total_customers) > .10 | customers_out >= 5000, # 10% of the county's customers
-        hour = round_date(run_start_time, unit = 'hour'),
-        fips_code = str_pad(fips_code, 5, pad = '0')
+      filter(
+        !is.na(fips_code),
+        !str_starts(fips_code, '78'),
+        !is.na(run_start_time),
+        !is.na(customers_out)
       ) %>%
-      pivot_longer(cols = matches('%'), names_to = 'threshold', values_to = 'outage_on') %>% 
-      group_by(threshold, fips_code, hour) %>%
-      summarize(outage_on = max(outage_on), .groups = 'drop') %>%
-      mutate(day = as.Date(hour)) %>%
-      group_by(fips_code, threshold, year = year(day)) 
-    write_dataset(eaglei, here('data/processed/eaglei-binned/'), existing_data_behavior = 'delete_matching')
+      left_join(tz_lookup, by = 'fips_code') %>%
+      group_by(tzid) %>%
+      group_split() %>%
+      map(
+        \(.x) .x %>%
+        mutate(
+          local_hour = hour(with_tz(run_start_time, first(tzid))),
+          fips_code = str_pad(fips_code, 5, pad = '0')
+        )
+      ) %>%
+      bind_rows()
+
+    ## match to satellite passes
+    outages_with_images <- eaglei %>%
+      mutate(run_end_time = run_start_time + (15*60)) %>%
+      left_join(
+        viirs_passes,
+        join_by(
+          x$fips_code == y$GEOID,
+          x$run_start_time <= y$viirs_end_datetime,
+          x$run_end_time >= y$viirs_start_datetime,
+        )
+      ) %>%
+      mutate(nighttime_image = (local_hour %in% c(0:2)) & !is.na(viirs_id)) # or look up sunrise/sunset?
+
+    nighttime_passes <- left_join(
+      outages_with_images %>%
+        filter(nighttime_image) %>%
+        transmute(
+          fips_code,
+          viirs_id,
+          run_start_time,
+          run_start_time_8hr_prior = run_start_time - hours(8),
+          viirs_start_datetime,
+          viirs_end_datetime,
+          tzid
+        ),
+      outages_with_images,
+      by = join_by(
+        fips_code,
+        viirs_start_datetime,
+        viirs_end_datetime,
+        tzid,
+        between(y$run_start_time, x$run_start_time_8hr_prior, x$run_start_time)
+      ),
+      suffix = c('', '_prior')
+    ) %>%
+      group_by(fips_code, run_start_time, viirs_id, viirs_start_datetime, viirs_end_datetime, tzid) %>%
+      arrange(desc(run_start_time_prior)) %>%
+      summarize(
+        total_customers = first(total_customers),
+        est_total_customers = first(est_total_customers),
+        customers_out = first(customers_out),
+        customers_out_8hr_prior = sum(customers_out)/(4*8) # div by 8 hrs of 15m intervals (missing => 0)
+      )
   }
-) 
+) %>%
+  bind_rows()
 
-# group by day and find if there are 8 consecutive hrs in that day
-eaglei <- open_dataset(here('data/processed/eaglei-binned/')) %>%
-  distinct() %>%
-  collect() 
+eaglei <- eaglei %>%
+  rename(
+    eaglei_outage_time_utc = run_start_time,
+    viirs_pass_start_time_utc = viirs_start_datetime,
+    viirs_pass_end_time_utc = viirs_end_datetime,
+  )
 
-eaglei <- setDT(eaglei)
-eaglei <- eaglei[, .(outage_8hr = slide_lgl(outage_on, ~all(.x == 1), .before = 7, .complete = TRUE)), by = .(fips_code, threshold, day)]
-eaglei_summary <- eaglei[, .(
-  outage = ifelse(all(is.na(outage_8hr)), 0L, max(outage_8hr, na.rm = TRUE))
-), by = .(fips_code, threshold, day)]
-
-setnames(eaglei_summary, 'fips_code', 'county_fips')
-eaglei_summary[, county_fips := str_pad(county_fips, 5, pad = '0')]
-
-eaglei <- left_join(eaglei_summary, fips_codes, by = 'county_fips') %>% 
-  select(-c(state, county)) %>% 
-  mutate(outage = as.logical(outage))  
-
-eaglei <- left_join(county_days, eaglei, by = c('threshold', 'county_fips', 'day')) %>%
-  complete(fill = list(outage = FALSE))
-write_parquet(eaglei, here('data/processed/eagle-i.parquet'))
+write_parquet(eaglei, here('outages-with-viirs-image.parquet'))
